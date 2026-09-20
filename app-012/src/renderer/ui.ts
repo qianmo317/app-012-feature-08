@@ -1,4 +1,16 @@
-import type { Prescription, WeighResult } from '../types';
+import type { Prescription, WeighResult, LevelRecord } from '../types';
+import type { StorageStatus } from '../storage';
+import { dayLabel, isToday, summarizeRecentDays, getWeakHerbs, compareWithPrevious } from '../records';
+import type { DaySummary } from '../records';
+
+export interface HistoryViewData {
+  status: StorageStatus;
+  records: LevelRecord[];
+  selectedDate: string;
+  /** 非 0 表示清除按钮正处在二次确认状态（到期时间戳） */
+  clearConfirmUntil: number;
+  now: number;
+}
 
 export class UIRenderer {
   prescriptionX: number = 20;
@@ -117,7 +129,7 @@ export class UIRenderer {
     this.buttonRects = [];
   }
 
-  drawMenu(ctx: CanvasRenderingContext2D, canvasW: number, canvasH: number, highestScore: number, highestLevel: number): void {
+  drawMenu(ctx: CanvasRenderingContext2D, canvasW: number, canvasH: number, highestScore: number, highestLevel: number, storageStatus: StorageStatus = 'ok'): void {
     ctx.fillStyle = '#1a1208';
     ctx.fillRect(0, 0, canvasW, canvasH);
 
@@ -128,19 +140,20 @@ export class UIRenderer {
     ctx.font = 'bold 36px "Microsoft YaHei", sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText('中药柜抓药', cx, cy - 120);
+    ctx.fillText('中药柜抓药', cx, cy - 150);
     ctx.font = '20px "Microsoft YaHei", sans-serif';
-    ctx.fillText('戥子称重模拟', cx, cy - 80);
+    ctx.fillText('戥子称重模拟', cx, cy - 110);
 
     const buttons = [
       { label: '开始游戏', action: 'start' },
       { label: '无尽模式', action: 'endless' },
+      { label: '战绩记录', action: 'history' },
     ];
 
     this.buttonRects = [];
     buttons.forEach((btn, i) => {
       const bx = cx - 80;
-      const by = cy - 20 + i * 60;
+      const by = cy - 50 + i * 60;
       const bw = 160;
       const bh = 44;
 
@@ -161,7 +174,253 @@ export class UIRenderer {
 
     ctx.fillStyle = '#888';
     ctx.font = '14px sans-serif';
-    ctx.fillText(`最高分: ${highestScore}  最高关卡: ${highestLevel}`, cx, cy + 120);
+    ctx.fillText(`最高分: ${highestScore}  最高关卡: ${highestLevel}`, cx, cy + 150);
+
+    if (storageStatus !== 'ok') {
+      ctx.fillStyle = '#ffb347';
+      ctx.font = '13px "Microsoft YaHei", sans-serif';
+      ctx.fillText(this.storageHint(storageStatus), cx, cy + 178);
+    }
+  }
+
+  private storageHint(status: StorageStatus): string {
+    if (status === 'unavailable') return '⚠ 浏览器禁用了本地存储，本次成绩将无法保存';
+    if (status === 'quota') return '⚠ 存储空间已满，新的成绩可能存不进去';
+    return '⚠ 旧的存档已损坏，历史成绩无法读取';
+  }
+
+  /** 游戏内顶部细条：存不了时一眼能看出来，而不是误以为自己没打过 */
+  drawStorageWarning(ctx: CanvasRenderingContext2D, canvasW: number, status: StorageStatus): void {
+    if (status === 'ok') return;
+    ctx.fillStyle = 'rgba(120, 60, 0, 0.85)';
+    ctx.fillRect(canvasW - 320, 54, 310, 26);
+    ctx.strokeStyle = '#ffb347';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(canvasW - 320, 54, 310, 26);
+    ctx.fillStyle = '#ffd9a0';
+    ctx.font = '12px "Microsoft YaHei", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(this.storageHint(status), canvasW - 165, 67);
+  }
+
+  drawHistory(ctx: CanvasRenderingContext2D, canvasW: number, canvasH: number, data: HistoryViewData): void {
+    ctx.fillStyle = '#1a1208';
+    ctx.fillRect(0, 0, canvasW, canvasH);
+
+    const pad = 24;
+    ctx.fillStyle = '#d4a574';
+    ctx.font = 'bold 24px "Microsoft YaHei", sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('战绩记录 · 最近七天', pad, 36);
+
+    const days = summarizeRecentDays(data.records, 7, data.now);
+    const status = data.status;
+
+    // 状态行：区分「没打过」和「存不了」
+    ctx.font = '13px "Microsoft YaHei", sans-serif';
+    if (status !== 'ok') {
+      ctx.fillStyle = '#ffb347';
+      ctx.fillText(this.storageHint(status), pad, 64);
+    } else if (data.records.length === 0) {
+      ctx.fillStyle = '#999';
+      ctx.fillText('还没有打过任何一关，成绩会在每关结束时自动记下。', pad, 64);
+    } else {
+      ctx.fillStyle = '#999';
+      ctx.fillText(`共 ${data.records.length} 条成绩（超过上限会自动丢弃最旧的）`, pad, 64);
+    }
+
+    const colsTop = 86;
+    const gap = 6;
+    const colW = Math.min(150, Math.max(30, (canvasW - pad * 2 - gap * 6) / 7));
+    const colsH = Math.max(132, Math.min(168, canvasH * 0.25));
+    this.buttonRects = [];
+
+    days.forEach((day, i) => {
+      const x = pad + i * (colW + gap);
+      const selected = day.date === data.selectedDate;
+      ctx.fillStyle = selected ? 'rgba(212,165,116,0.35)' : 'rgba(255,252,245,0.07)';
+      ctx.fillRect(x, colsTop, colW, colsH);
+      ctx.strokeStyle = selected ? '#d4a574' : 'rgba(212,165,116,0.35)';
+      ctx.lineWidth = selected ? 2 : 1;
+      ctx.strokeRect(x, colsTop, colW, colsH);
+
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = isToday(day.date, data.now) ? '#f0c674' : '#d8c4a8';
+      ctx.font = 'bold 11px "Microsoft YaHei", sans-serif';
+      const label = dayLabel(day.date);
+      ctx.fillText(colW < 80 ? label.replace(' 周', '\n周').split('\n')[0] : label, x + 6, colsTop + 12);
+      if (colW < 80) {
+        ctx.fillText(label.slice(label.indexOf('周')), x + 6, colsTop + 25);
+      }
+
+      if (day.count === 0) {
+        ctx.fillStyle = '#777';
+        ctx.font = '12px "Microsoft YaHei", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(status === 'ok' ? '未游玩' : '—', x + colW / 2, colsTop + colsH / 2 + 8);
+      } else {
+        const narrow = colW < 80;
+        const lines = [
+          `${day.count}关`,
+          narrow ? `均${day.avgScore}` : `均分 ${day.avgScore}`,
+          narrow ? `高${day.bestScore}` : `最高 ${day.bestScore}`,
+          `过${day.passedCount}/${day.count}`,
+        ];
+        if (day.reviewWrongCount > 0) lines.push(narrow ? `错${day.reviewWrongCount}` : `复核错 ${day.reviewWrongCount}`);
+        ctx.font = narrow ? '11px sans-serif' : '12px "Microsoft YaHei", sans-serif';
+        ctx.textAlign = 'left';
+        lines.forEach((line, li) => {
+          ctx.fillStyle = li === 1 ? '#e8dcc8' : '#b8a88f';
+          ctx.fillText(line, x + 6, colsTop + 34 + li * 18);
+        });
+      }
+
+      this.buttonRects.push({ x, y: colsTop, w: colW, h: colsH, action: `day-${day.date}` });
+    });
+
+    const bodyTop = colsTop + colsH + 16;
+    const bodyH = canvasH - bodyTop - 70;
+    const panelW = canvasW - pad * 2;
+    // 窄屏放两行布局，宽屏左右两栏
+    const stacked = panelW < 600;
+    const leftW = stacked ? panelW : Math.round(panelW * 0.62) - 6;
+    const rightW = stacked ? panelW : panelW - leftW - 12;
+
+    // 左下：选中当天的逐关明细，标明比上次同关好还是差
+    const selected: DaySummary = days.find(d => d.date === data.selectedDate) ?? days[days.length - 1];
+    const leftBox = { x: pad, y: bodyTop, w: leftW, h: stacked ? Math.floor(bodyH * 0.56) - 6 : bodyH };
+    ctx.fillStyle = 'rgba(255,252,245,0.06)';
+    ctx.fillRect(leftBox.x, leftBox.y, leftBox.w, leftBox.h);
+    ctx.strokeStyle = 'rgba(212,165,116,0.3)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(leftBox.x, leftBox.y, leftBox.w, leftBox.h);
+
+    ctx.fillStyle = '#d4a574';
+    ctx.font = 'bold 15px "Microsoft YaHei", sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`${dayLabel(selected.date)} 逐关成绩`, leftBox.x + 12, leftBox.y + 18);
+
+    if (selected.records.length === 0) {
+      ctx.fillStyle = '#888';
+      ctx.font = '13px "Microsoft YaHei", sans-serif';
+      ctx.fillText(status === 'ok' ? '这天没有游玩记录。' : '存储不可用，读不到这天的成绩。', leftBox.x + 12, leftBox.y + 48);
+    } else {
+      const listTop = leftBox.y + 46;
+      const narrowText = leftBox.w < 300;
+      const rowH = narrowText ? 40 : 28;
+      const maxShown = Math.max(1, Math.min(selected.records.length, Math.floor((leftBox.h - 48) / rowH)));
+      const shown = selected.records.slice(0, maxShown);
+      shown.forEach((r, i) => {
+        const cmp = compareWithPrevious(data.records, r);
+        const ry = listTop + i * rowH;
+        const time = new Date(r.ts);
+        const hm = `${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}`;
+
+        ctx.fillStyle = '#cbb89a';
+        ctx.font = '13px sans-serif';
+        ctx.fillText(hm, leftBox.x + 12, ry);
+
+        ctx.fillStyle = r.passed ? '#90ee90' : r.outcome === 'timeout' ? '#ffb347' : '#ff8080';
+        ctx.font = 'bold 13px "Microsoft YaHei", sans-serif';
+        const mark = r.passed ? '✓' : r.outcome === 'timeout' ? '时' : '败';
+        ctx.fillText(mark, leftBox.x + 62, ry);
+
+        ctx.fillStyle = '#e8dcc8';
+        ctx.font = '13px "Microsoft YaHei", sans-serif';
+        ctx.fillText(`第${r.level}关 ${r.score}分`, leftBox.x + 82, ry);
+
+        let suffix = '';
+        if (cmp.trend === 'first') suffix = '首次';
+        else if (cmp.trend === 'better') suffix = `▲ 比上次 +${cmp.diff}`;
+        else if (cmp.trend === 'worse') suffix = `▼ 比上次 ${cmp.diff}`;
+        else suffix = '＝ 与上次持平';
+
+        if (r.reviewCorrect === false) suffix += '  ⚠复核答错';
+
+        ctx.fillStyle = cmp.trend === 'better' ? '#90ee90' : cmp.trend === 'worse' ? '#ff8080' : '#a99676';
+        ctx.font = '12px "Microsoft YaHei", sans-serif';
+        if (narrowText) {
+          ctx.fillText(suffix, leftBox.x + 82, ry + 16);
+        } else {
+          ctx.fillText(suffix, leftBox.x + 180, ry);
+        }
+      });
+      const hidden = selected.records.length - maxShown;
+      if (hidden > 0) {
+        ctx.fillStyle = '#888';
+        ctx.font = '12px "Microsoft YaHei", sans-serif';
+        ctx.fillText(`还有 ${hidden} 条更早的未列出`, leftBox.x + 12, listTop + maxShown * rowH + 6);
+      }
+    }
+
+    // 右下/下方：老是称不准的药（基于全部历史）
+    const rightBox = stacked
+      ? { x: pad, y: leftBox.y + leftBox.h + 12, w: rightW, h: bodyH - leftBox.h - 12 }
+      : { x: pad + leftW + 12, y: bodyTop, w: rightW, h: bodyH };
+    ctx.fillStyle = 'rgba(255,252,245,0.06)';
+    ctx.fillRect(rightBox.x, rightBox.y, rightBox.w, rightBox.h);
+    ctx.strokeStyle = 'rgba(212,165,116,0.3)';
+    ctx.strokeRect(rightBox.x, rightBox.y, rightBox.w, rightBox.h);
+
+    ctx.fillStyle = '#d4a574';
+    ctx.font = 'bold 15px "Microsoft YaHei", sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('称不准的药（全部历史）', rightBox.x + 12, rightBox.y + 18);
+
+    const weak = getWeakHerbs(data.records, 5);
+    if (weak.length === 0) {
+      ctx.fillStyle = '#888';
+      ctx.font = '13px "Microsoft YaHei", sans-serif';
+      ctx.fillText(status === 'ok' ? '暂时没有失准记录，秤握得很稳。' : '存储不可用，无法统计。', rightBox.x + 12, rightBox.y + 48);
+    } else {
+      const maxWeak = Math.max(1, Math.min(weak.length, Math.floor((rightBox.h - 40) / 30)));
+      weak.slice(0, maxWeak).forEach((s, i) => {
+        const wy = rightBox.y + 48 + i * 30;
+        ctx.fillStyle = '#e8dcc8';
+        ctx.font = 'bold 13px "Microsoft YaHei", sans-serif';
+        ctx.fillText(`${i + 1}. ${s.herb}`, rightBox.x + 12, wy);
+        ctx.fillStyle = '#b8a88f';
+        ctx.font = '12px "Microsoft YaHei", sans-serif';
+        ctx.fillText(`失准 ${s.badCount}/${s.attempts} 次 · 平均偏差 ${s.avgAbsDelta.toFixed(1)}g`, rightBox.x + 12, wy + 16);
+      });
+    }
+
+    // 底部按钮：返回 + 清除（点两下确认，防手滑）
+    const confirming = data.now < data.clearConfirmUntil;
+    const back = { x: pad, y: canvasH - 52, w: 120, h: 36 };
+    this.drawPillButton(ctx, back.x, back.y, back.w, back.h, '返回菜单');
+    this.buttonRects.push({ ...back, action: 'back-menu' });
+
+    const clear = { x: canvasW - pad - 170, y: canvasH - 52, w: 170, h: 36 };
+    const canClear = status === 'ok';
+    this.drawPillButton(ctx, clear.x, clear.y, clear.w, clear.h, confirming ? '再点一次确认清空' : '清空全部成绩', confirming, canClear);
+    if (canClear) {
+      this.buttonRects.push({ ...clear, action: confirming ? 'clear-confirm' : 'clear-ask' });
+    }
+
+    if (status !== 'ok') {
+      ctx.fillStyle = '#ffb347';
+      ctx.font = '12px "Microsoft YaHei", sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText('当前存储不可用，没有成绩可以清空', clear.x - 12, canvasH - 34);
+    }
+  }
+
+  private drawPillButton(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, label: string, danger = false, enabled = true): void {
+    ctx.fillStyle = enabled ? danger ? '#7a2323' : '#6b4e23' : '#44403c';
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = enabled ? danger ? '#ff8080' : '#d4a574' : '#666';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = enabled ? '#f5e6d3' : '#999';
+    ctx.font = '15px "Microsoft YaHei", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, x + w / 2, y + h / 2);
   }
 
   drawReview(ctx: CanvasRenderingContext2D, canvasW: number, canvasH: number, herb: string, options: number[], selected: number | null, result: boolean | null): void {
@@ -214,7 +473,7 @@ export class UIRenderer {
     }
   }
 
-  drawResult(ctx: CanvasRenderingContext2D, canvasW: number, canvasH: number, score: number, level: number, results: WeighResult[], passed: boolean): void {
+  drawResult(ctx: CanvasRenderingContext2D, canvasW: number, canvasH: number, score: number, level: number, results: WeighResult[], passed: boolean, lastSaveStatus: StorageStatus | null = null): void {
     const cx = canvasW / 2;
     const cy = canvasH / 2;
 
@@ -246,6 +505,18 @@ export class UIRenderer {
       ctx.fillText(`${r.herb}: 目标${r.target}g 实际${r.actual.toFixed(1)}g 差${r.deltaG > 0 ? '+' : ''}${r.deltaG.toFixed(1)}g`, cx - 160, ry);
     });
 
+    // 本关成绩是否落盘：存不下要让玩家看出来，而不是以为系统记了
+    // 弹窗外（药味列表可能占满弹窗），放底部留白处
+    ctx.font = '13px "Microsoft YaHei", sans-serif';
+    ctx.textAlign = 'center';
+    if (lastSaveStatus === 'ok') {
+      ctx.fillStyle = '#9aa87c';
+      ctx.fillText('本关成绩已记入战绩', cx, cy + 205);
+    } else if (lastSaveStatus !== null) {
+      ctx.fillStyle = '#ffb347';
+      ctx.fillText('⚠ 本关成绩未能保存（本地存储不可用）', cx, cy + 205);
+    }
+
     this.buttonRects = [];
     const btnLabel = passed ? '下一关' : '重试';
     const bx = cx - 60;
@@ -268,7 +539,7 @@ export class UIRenderer {
     this.buttonRects.push({ x: bx, y: by, w: bw, h: bh, action: passed ? 'next' : 'retry' });
   }
 
-  drawGameOver(ctx: CanvasRenderingContext2D, canvasW: number, canvasH: number, score: number, level: number): void {
+  drawGameOver(ctx: CanvasRenderingContext2D, canvasW: number, canvasH: number, score: number, level: number, lastSaveStatus: StorageStatus | null = null): void {
     const cx = canvasW / 2;
     const cy = canvasH / 2;
 
@@ -285,23 +556,27 @@ export class UIRenderer {
     ctx.font = '20px sans-serif';
     ctx.fillText(`最终得分: ${score}  通过关卡: ${level}`, cx, cy);
 
+    ctx.font = '13px "Microsoft YaHei", sans-serif';
+    if (lastSaveStatus === 'ok') {
+      ctx.fillStyle = '#7fae6e';
+      ctx.fillText('本局各关成绩已记入战绩', cx, cy + 32);
+    } else if (lastSaveStatus !== null) {
+      ctx.fillStyle = '#ffb347';
+      ctx.fillText('⚠ 成绩未能保存（本地存储不可用）', cx, cy + 32);
+    }
+
     this.buttonRects = [];
-    const bx = cx - 60;
-    const by = cy + 50;
     const bw = 120;
     const bh = 40;
+    const by = cy + 50;
+    const bxMenu = cx + 10;
+    const bxHistory = cx - bw - 10;
 
-    ctx.fillStyle = '#6b4e23';
-    ctx.fillRect(bx, by, bw, bh);
-    ctx.strokeStyle = '#d4a574';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(bx, by, bw, bh);
+    this.drawPillButton(ctx, bxHistory, by, bw, bh, '战绩记录');
+    this.buttonRects.push({ x: bxHistory, y: by, w: bw, h: bh, action: 'history' });
 
-    ctx.fillStyle = '#f5e6d3';
-    ctx.font = '18px "Microsoft YaHei", sans-serif';
-    ctx.fillText('返回菜单', cx, by + bh / 2);
-
-    this.buttonRects.push({ x: bx, y: by, w: bw, h: bh, action: 'menu' });
+    this.drawPillButton(ctx, bxMenu, by, bw, bh, '返回菜单');
+    this.buttonRects.push({ x: bxMenu, y: by, w: bw, h: bh, action: 'menu' });
   }
 
   drawInstructions(ctx: CanvasRenderingContext2D, _canvasW: number, canvasH: number): void {

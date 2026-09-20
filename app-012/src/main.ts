@@ -4,13 +4,8 @@ import { loadSave, saveSave } from './storage';
 const game = new ApothecaryGame('game-canvas');
 game.start();
 
+// 成绩已在每关结束时即时写入；这里只更新“最近游玩时间”摘要，写失败也无所谓
 window.addEventListener('beforeunload', () => {
-  const save = loadSave();
-  const currentScore = (game.game?.state?.score) ?? 0;
-  const currentLevel = (game.game?.state?.level) ?? 0;
-  saveSave({
-    highestScore: Math.max(save.highestScore, currentScore),
-    highestLevel: Math.max(save.highestLevel, currentLevel),
-    lastPlayed: Date.now(),
-  });
+  const { data } = loadSave();
+  saveSave({ ...data, lastPlayed: Date.now() });
 });

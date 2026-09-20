@@ -2,9 +2,17 @@ import { GameCanvas } from '../renderer/canvas';
 import { CabinetRenderer } from '../renderer/cabinet';
 import { ScaleRenderer } from '../renderer/scale';
 import { UIRenderer } from '../renderer/ui';
+import type { HistoryViewData } from '../renderer/ui';
 import { GameManager } from './state';
 import { getHerbByName } from '../herbs';
 import { resumeAudio, playDrawerSound, playDropSound, playPointerSound, playErrorSound, playSuccessSound } from '../audio/synth';
+import { loadSave, appendRecord, makeRecord, clearSave, getStorageStatus } from '../storage';
+import type { StorageStatus } from '../storage';
+import type { NewRecord } from '../records';
+import { localDateKey, recentDateKeys } from '../records';
+import type { GamePhase } from '../types';
+
+const CLEAR_CONFIRM_MS = 3000;
 
 export class ApothecaryGame {
   canvas: GameCanvas;
@@ -16,15 +24,34 @@ export class ApothecaryGame {
   mouseX = 0;
   mouseY = 0;
 
+  /** 最近一次写战绩的结果，结算弹窗据此提示 */
+  private lastSaveStatus: StorageStatus | null = null;
+
+  /** 从战绩页返回时回到哪个阶段 */
+  private historyReturnPhase: GamePhase = 'menu';
+
+  private historySelectedDate = localDateKey(Date.now());
+  private clearConfirmUntil = 0;
+
+  private get showHistory(): boolean {
+    return this.game.phase === 'history';
+  }
+
   constructor(canvasId: string) {
     this.canvas = new GameCanvas(canvasId);
     this.cabinet = new CabinetRenderer();
     this.scale = new ScaleRenderer();
     this.ui = new UIRenderer();
     this.game = new GameManager();
+    this.game.onRecord = (record: NewRecord) => this.persistRecord(record);
     this.setupInput();
     this.resize();
     this.loop = this.loop.bind(this);
+  }
+
+  private persistRecord(record: NewRecord): void {
+    const result = appendRecord(makeRecord(record));
+    this.lastSaveStatus = result.status === 'ok' ? 'ok' : result.status;
   }
 
   resize(): void {
@@ -52,6 +79,11 @@ export class ApothecaryGame {
     const h = this.canvas.height;
     ctx.clearRect(0, 0, w, h);
 
+    if (this.showHistory) {
+      this.renderHistory(ctx, w, h);
+      return;
+    }
+
     if (this.game.phase === 'menu') {
       this.renderMenu(ctx, w, h);
       return;
@@ -68,6 +100,7 @@ export class ApothecaryGame {
     }
 
     this.ui.drawStatus(ctx, this.game.state.level, this.game.state.score, this.game.state.combo, this.game.state.queue, this.game.state.satisfaction, this.game.getTimeLeft());
+    this.ui.drawStorageWarning(ctx, w, getStorageStatus());
     this.ui.drawPackageArea(ctx, w, h, this.game.packages);
     this.ui.drawInstructions(ctx, w, h);
 
@@ -104,15 +137,74 @@ export class ApothecaryGame {
         this.ui.drawReview(ctx, w, h, this.game.reviewQuestion.herb, this.game.reviewQuestion.options, this.game.reviewSelected, this.game.reviewResult);
       }
     } else if (this.game.phase === 'result') {
-      this.ui.drawResult(ctx, w, h, this.game.state.score, this.game.state.level, this.game.results, this.game.results.every(r => r.ok));
+      this.ui.drawResult(ctx, w, h, this.game.state.score, this.game.state.level, this.game.results, this.game.levelPassed, this.lastSaveStatus);
     } else if (this.game.phase === 'gameover') {
-      this.ui.drawGameOver(ctx, w, h, this.game.state.score, this.game.state.level);
+      this.ui.drawGameOver(ctx, w, h, this.game.state.score, this.game.state.level, this.lastSaveStatus);
     }
   }
 
   renderMenu(ctx: CanvasRenderingContext2D, w: number, h: number): void {
-    const save = loadSaveData();
-    this.ui.drawMenu(ctx, w, h, save.highestScore, save.highestLevel);
+    const { data, status } = loadSave();
+    this.ui.drawMenu(ctx, w, h, data.highestScore, data.highestLevel, status === 'ok' ? 'ok' : status);
+  }
+
+  private renderHistory(ctx: CanvasRenderingContext2D, w: number, h: number): void {
+    const { data, status } = loadSave();
+    // 当前选中日若不在最近七天范围内（跨天停留），落到七天内最近有记录的一天
+    const keys = recentDateKeys(7);
+    if (!keys.includes(this.historySelectedDate)) {
+      this.historySelectedDate = this.defaultSelectedDate(data.records, keys);
+    }
+    const view: HistoryViewData = {
+      status,
+      records: data.records,
+      selectedDate: this.historySelectedDate,
+      clearConfirmUntil: this.clearConfirmUntil,
+      now: Date.now(),
+    };
+    this.ui.drawHistory(ctx, w, h, view);
+  }
+
+  private defaultSelectedDate(records: ReturnType<typeof loadSave>['data']['records'], keys: string[]): string {
+    const have = new Set(records.map(r => r.date));
+    for (let i = keys.length - 1; i >= 0; i--) {
+      if (have.has(keys[i])) return keys[i];
+    }
+    return keys[keys.length - 1];
+  }
+
+  private openHistory(): void {
+    const { data } = loadSave();
+    this.clearConfirmUntil = 0;
+    this.historySelectedDate = this.defaultSelectedDate(data.records, recentDateKeys(7));
+    this.historyReturnPhase = this.game.phase;
+    this.game.phase = 'history';
+  }
+
+  private closeHistory(): void {
+    this.game.phase = this.historyReturnPhase === 'history' ? 'menu' : this.historyReturnPhase;
+    this.clearConfirmUntil = 0;
+  }
+
+  private handleHistoryClick(action: string): void {
+    if (action.startsWith('day-')) {
+      this.historySelectedDate = action.slice(4);
+      return;
+    }
+    if (action === 'back-menu') {
+      this.closeHistory();
+      return;
+    }
+    if (action === 'clear-ask') {
+      // 第一下只进入待确认状态，3 秒内再点才真清
+      this.clearConfirmUntil = Date.now() + CLEAR_CONFIRM_MS;
+      return;
+    }
+    if (action === 'clear-confirm') {
+      clearSave();
+      this.clearConfirmUntil = 0;
+      this.historySelectedDate = recentDateKeys(7)[6];
+    }
   }
 
   drawHerbPile(ctx: CanvasRenderingContext2D, x: number, y: number, color: string, size: number): void {
@@ -188,15 +280,25 @@ export class ApothecaryGame {
   }
 
   handlePointerDown(x: number, y: number): void {
+    if (this.showHistory) {
+      const btn = this.ui.buttonRects.find(b => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h);
+      if (btn) this.handleHistoryClick(btn.action);
+      return;
+    }
+
     if (this.game.phase === 'menu') {
       const btn = this.ui.buttonRects.find(b => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h);
       if (btn) {
         if (btn.action === 'start') {
-          this.game.startLevel(1, false);
+          this.lastSaveStatus = null;
+          this.game.startNewGame(false);
           this.cabinet.setHerbs(this.game.herbs);
         } else if (btn.action === 'endless') {
-          this.game.startLevel(1, true);
+          this.lastSaveStatus = null;
+          this.game.startNewGame(true);
           this.cabinet.setHerbs(this.game.herbs);
+        } else if (btn.action === 'history') {
+          this.openHistory();
         }
       }
       return;
@@ -217,11 +319,15 @@ export class ApothecaryGame {
       const btn = this.ui.buttonRects.find(b => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h);
       if (btn) {
         if (btn.action === 'next') {
+          this.lastSaveStatus = null;
           this.game.nextLevel();
           this.cabinet.setHerbs(this.game.herbs);
         } else if (btn.action === 'retry') {
+          this.lastSaveStatus = null;
           this.game.retryLevel();
           this.cabinet.setHerbs(this.game.herbs);
+        } else if (btn.action === 'history') {
+          this.openHistory();
         } else if (btn.action === 'menu') {
           this.game.phase = 'menu';
         }
@@ -290,9 +396,15 @@ export class ApothecaryGame {
   }
 
   handleKey(key: string): void {
+    if (this.showHistory) {
+      if (key === 'Escape' || key === 'Backspace') this.closeHistory();
+      return;
+    }
+
     if (this.game.phase === 'menu') {
       if (key === 'Enter' || key === ' ') {
-        this.game.startLevel(1, false);
+        this.lastSaveStatus = null;
+        this.game.startNewGame(false);
         this.cabinet.setHerbs(this.game.herbs);
       }
       return;
@@ -340,8 +452,8 @@ export class ApothecaryGame {
 
     if (this.game.phase === 'result') {
       if (key === 'Enter' || key === ' ') {
-        const passed = this.game.results.every(r => r.ok);
-        if (passed) {
+        this.lastSaveStatus = null;
+        if (this.game.levelPassed) {
           this.game.nextLevel();
         } else {
           this.game.retryLevel();
@@ -358,17 +470,4 @@ export class ApothecaryGame {
       return;
     }
   }
-}
-
-function loadSaveData(): { highestScore: number; highestLevel: number } {
-  try {
-    const raw = localStorage.getItem('apothecary-weighing-v1');
-    if (raw) {
-      const data = JSON.parse(raw);
-      return { highestScore: data.highestScore ?? 0, highestLevel: data.highestLevel ?? 0 };
-    }
-  } catch {
-    // ignore
-  }
-  return { highestScore: 0, highestLevel: 0 };
 }
