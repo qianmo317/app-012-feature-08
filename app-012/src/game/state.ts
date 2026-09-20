@@ -1,4 +1,4 @@
-import type { GameState, GamePhase, Prescription, WeighResult, LevelConfig } from '../types';
+import type { GameState, GamePhase, Prescription, WeighResult, LevelConfig, LevelFinishSummary } from '../types';
 import { getLevelConfig } from '../levels';
 import { generatePrescription, generateReviewQuestion } from '../prescription';
 import { judgeWeight, getWeightStatus } from '../weighing';
@@ -44,9 +44,25 @@ export class GameManager {
   flashingDrawer: string | null = null;
   flashTime = 0;
 
-  startLevel(level: number, endless = false): void {
+  /** 本关开始时的累计分，用于算本关新得的分 */
+  levelStartScore = 0;
+  private levelStartTime = 0;
+  /** 防止 setTimeout 与超时路径重复结算同一关 */
+  private levelFinalized = false;
+  /** 本关复核答案 */
+  private reviewAnswer: { herb: string; correct: boolean } | null = null;
+  /** 每关结算（通过/失败/超时）时回调，main 负责落盘 */
+  onLevelFinish: ((summary: LevelFinishSummary) => void) | null = null;
+
+  startLevel(level: number, endless = false, resetScore = false): void {
     this.endless = endless;
     this.state.level = level;
+    if (resetScore) {
+      this.state.score = 0;
+      this.state.combo = 0;
+      this.state.queue = 3;
+      this.state.satisfaction = 100;
+    }
     this.state.expired = false;
     this.levelConfig = getLevelConfig(level);
     this.prescription = generatePrescription(this.levelConfig);
@@ -66,6 +82,10 @@ export class GameManager {
     this.lastTick = performance.now();
     this.drawerOpen = new Set();
     this.draggingHerb = null;
+    this.levelStartScore = this.state.score;
+    this.levelStartTime = Date.now();
+    this.levelFinalized = false;
+    this.reviewAnswer = null;
     this.phase = 'playing';
   }
 
@@ -166,17 +186,21 @@ export class GameManager {
     this.reviewSelected = answer;
     const correct = answer === this.reviewQuestion.correct;
     this.reviewResult = correct;
+    this.reviewAnswer = { herb: this.reviewQuestion.herb, correct };
     if (!correct) {
       this.state.satisfaction -= 10;
       this.state.combo = 0;
     } else {
       this.state.satisfaction = Math.min(100, this.state.satisfaction + 5);
     }
-    setTimeout(() => this.finishLevel(), 1500);
+    setTimeout(() => this.finishLevel(false), 1500);
     return correct;
   }
 
-  finishLevel(): void {
+  finishLevel(timeout = false): void {
+    if (this.levelFinalized) return;
+    this.levelFinalized = true;
+
     const passed = this.results.every(r => r.ok) && this.state.satisfaction > 0;
     if (passed) {
       this.state.queue = Math.min(10, this.state.queue + 1);
@@ -185,11 +209,36 @@ export class GameManager {
       this.state.satisfaction = Math.max(0, this.state.satisfaction - 20);
     }
 
+    this.emitFinish(passed, timeout);
+
     if (this.state.queue <= 0 || this.state.satisfaction <= 0) {
       this.phase = 'gameover';
     } else {
       this.phase = 'result';
     }
+  }
+
+  private emitFinish(passed: boolean, timeout: boolean): void {
+    if (!this.onLevelFinish) return;
+    const tolerance = this.levelConfig.tolerance;
+    this.onLevelFinish({
+      timestamp: Date.now(),
+      level: this.state.level,
+      mode: this.endless ? 'endless' : 'normal',
+      passed,
+      timeout,
+      scoreGained: this.state.score - this.levelStartScore,
+      totalScore: this.state.score,
+      durationMs: Date.now() - this.levelStartTime,
+      review: this.reviewAnswer,
+      attempts: this.results.map(r => ({
+        herb: r.herb,
+        target: r.target,
+        actual: r.actual,
+        tolerance,
+        ok: r.ok,
+      })),
+    });
   }
 
   nextLevel(): void {
@@ -201,9 +250,12 @@ export class GameManager {
   }
 
   handleTimeout(): void {
+    if (this.levelFinalized) return;
+    this.levelFinalized = true;
     this.state.queue--;
-    this.state.satisfaction -= 15;
+    this.state.satisfaction = Math.max(0, this.state.satisfaction - 15);
     this.state.combo = 0;
+    this.emitFinish(false, true);
     if (this.state.queue <= 0 || this.state.satisfaction <= 0) {
       this.phase = 'gameover';
     } else {
